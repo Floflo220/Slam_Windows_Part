@@ -1,0 +1,82 @@
+import cv2
+import numpy as np
+import sys
+
+# --- Chargement du YAML ORB-SLAM3 ---
+fs = cv2.FileStorage("a3_fisheye_filtered.yaml", cv2.FILE_STORAGE_READ)
+
+def mat_from_yaml(fs, key, shape):
+    raw = fs.getNode(key).mat()
+    return np.array(raw, dtype=np.float32).reshape(shape)
+
+imageSize = (int(fs.getNode("Camera.width").real()), int(fs.getNode("Camera.height").real()))
+
+# --- Matrices intrinsèques et distorsions ---
+K1 = np.array([[fs.getNode("Camera1.fx").real(), 0, fs.getNode("Camera1.cx").real()],
+               [0, fs.getNode("Camera1.fy").real(), fs.getNode("Camera1.cy").real()],
+               [0, 0, 1]], dtype=np.float32)
+D1 = np.array([[fs.getNode("Camera1.k1").real()],
+               [fs.getNode("Camera1.k2").real()],
+               [fs.getNode("Camera1.k3").real()],
+               [fs.getNode("Camera1.k4").real()]], dtype=np.float32)
+
+K2 = np.array([[fs.getNode("Camera2.fx").real(), 0, fs.getNode("Camera2.cx").real()],
+               [0, fs.getNode("Camera2.fy").real(), fs.getNode("Camera2.cy").real()],
+               [0, 0, 1]], dtype=np.float32)
+D2 = np.array([[fs.getNode("Camera2.k1").real()],
+               [fs.getNode("Camera2.k2").real()],
+               [fs.getNode("Camera2.k3").real()],
+               [fs.getNode("Camera2.k4").real()]], dtype=np.float32)
+
+# --- Transformation 4x4 vers R et T ---
+T_c1_c2 = fs.getNode("Stereo.T_c1_c2").mat()
+fs.release()
+
+R = T_c1_c2[:3, :3].astype(np.float32)
+T = T_c1_c2[:3, 3:4].astype(np.float32)  # colonne (3,1)
+
+# --- Rectification ---
+R1, R2, P1, P2, Q = cv2.fisheye.stereoRectify(
+    K1, D1, K2, D2, imageSize, R, T, flags=cv2.CALIB_ZERO_DISPARITY
+)
+
+balance = 0.0
+newK1 = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(K1, D1, imageSize, R1, P1[:3,:3], balance, imageSize)
+newK2 = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(K2, D2, imageSize, R2, P2[:3,:3], balance, imageSize)
+P1[:3, :3], P2[:3, :3] = newK1, newK2
+
+map1L, map2L = cv2.fisheye.initUndistortRectifyMap(K1, D1, R1, P1, imageSize, cv2.CV_16SC2)
+map1R, map2R = cv2.fisheye.initUndistortRectifyMap(K2, D2, R2, P2, imageSize, cv2.CV_16SC2)
+
+# --- Séparation des images gauche/droite ---
+def split_eyes(f): return f[:, :640], f[:, 640:]
+
+# --- Capture du flux ---
+stream_url = 'http://10.241.226.103:5000/video'
+cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
+if not cap.isOpened():
+    print("Erreur : flux non ouvert")
+    sys.exit(1)
+
+while True:
+    ret, frame = cap.read()
+    if not ret or frame is None:
+        print("Erreur de lecture du flux")
+        continue
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    L, R = split_eyes(gray)
+
+    # Rectification
+    undL = cv2.remap(L, map1L, map2L, cv2.INTER_LINEAR)
+    undR = cv2.remap(R, map1R, map2R, cv2.INTER_LINEAR)
+
+    # Affichage
+    cv2.imshow("Gauche redressée", undL)
+    cv2.imshow("Droite redressée", undR)
+
+    if cv2.waitKey(1) & 0xFF in (27, ord('q')):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
